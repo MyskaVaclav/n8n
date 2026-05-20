@@ -1,0 +1,188 @@
+{
+  "name": "Retry logika",
+  "nodes": [
+    {
+      "parameters": {
+        "amount": 10,
+        "unit": "minutes"
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        192,
+        0
+      ],
+      "id": "d77248f3-a84e-4e15-8fbd-e714bbfbec91",
+      "name": "Wait",
+      "webhookId": "05dd17cb-21f8-4c35-aa93-94c1fc9d5c44"
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "BZ1W3QGgBmN2PBAe",
+          "mode": "id",
+          "cachedResultUrl": "/workflow/BZ1W3QGgBmN2PBAe"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "forceEndDt": "={{ $json.forceEndDt }}",
+            "windowStart": "={{ $json.windowStart }}",
+            "windowEnd": "={{ $json.windowEnd }}",
+            "now": "={{ $json.now }}",
+            "slotKind": "={{ $json.slotKind }}",
+            "computedFrom": "={{ $json.computedFrom }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "forceEndDt",
+              "displayName": "forceEndDt",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "windowStart",
+              "displayName": "windowStart",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "windowEnd",
+              "displayName": "windowEnd",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "now",
+              "displayName": "now",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "slotKind",
+              "displayName": "slotKind",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "computedFrom",
+              "displayName": "computedFrom",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string",
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        416,
+        0
+      ],
+      "id": "7f5b08c7-da8f-477c-90fd-9196327dea88",
+      "name": "Call 'Zapisování dat do tabulky'"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        -256,
+        0
+      ],
+      "id": "95dad57a-4904-432a-94da-fa2488a41faf",
+      "name": "Error Trigger",
+      "retryOnFail": false
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Code node (put right after Error Trigger, BEFORE Wait)\n * Freezes the previous aligned :00/:30 time window based on \"now\".\n */\n\nfunction floorToHalfHour(d) {\n  const x = new Date(d);\n  x.setSeconds(0, 0);\n  const m = x.getMinutes();\n  x.setMinutes(m < 30 ? 0 : 30, 0, 0);\n  return x;\n}\n\nfunction addMinutes(d, mins) {\n  return new Date(d.getTime() + mins * 60_000);\n}\n\nconst now = new Date();\n\n// previous boundary (slot end)\nconst windowEnd = floorToHalfHour(now);\n// previous 30-minute window\nconst windowStart = addMinutes(windowEnd, -30);\n\nreturn [{\n  json: {\n    // Send these to the main workflow\n    forceEndDt: windowEnd.toISOString(),\n    windowStart: windowStart.toISOString(),\n    windowEnd: windowEnd.toISOString(),\n\n    // optional debug\n    now: now.toISOString(),\n    slotKind: windowEnd.getMinutes() === 0 ? \"hour\" : \"halfHour\",\n    computedFrom: \"now_before_wait\",\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -32,
+        0
+      ],
+      "id": "fb4c16ca-35c8-4eb2-8900-39d70958e865",
+      "name": "Code in JavaScript"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "Call 'Zapisování dat do tabulky'",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "6077fd79-eb2f-4041-9fcc-539639af1531",
+  "meta": {
+    "instanceId": "e9f60320df6fdfd2f89899a4f638642b679b7922cfc622ec30f5ebe626cc077b"
+  },
+  "id": "FO3st3ec-P26sbhpVLE3w",
+  "tags": []
+}

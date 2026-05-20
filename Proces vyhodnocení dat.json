@@ -1,0 +1,311 @@
+{
+  "name": "Proces vyhodnocení dat",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtMinute": 1
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -80,
+        -256
+      ],
+      "id": "3f503bed-b8ef-4ea9-8db7-342d5e4f8299",
+      "name": "Spuštění jednou za 24 hodin"
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "1SwINCHsHh3krQJJq6sMQxNNW2w1G3VTS_q0HTx-LLLQ",
+          "mode": "list",
+          "cachedResultName": "N8N databáze",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1SwINCHsHh3krQJJq6sMQxNNW2w1G3VTS_q0HTx-LLLQ/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "List 1",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1SwINCHsHh3krQJJq6sMQxNNW2w1G3VTS_q0HTx-LLLQ/edit#gid=0"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        144,
+        -256
+      ],
+      "id": "454dc0d3-0629-4371-b8b6-4d7c4f3afaa3",
+      "name": "Načtení dat z Google sheets",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * 24h compliance evaluator for BESS metrics (from Google Sheets).\n * Outputs violation intervals (start -> resolved) instead of per-timestamp events.\n * Adds rounding + compact display fields.\n * Spread violations: collects ALL involved IDs across the interval (instead of ID max/min).\n *\n * DST-safe for Europe/Prague (handles CET/CEST automatically).\n */\n\n// ---------- CONFIG ----------\nconst COL = {\n  time: \"time\",\n\n  cellVmin: \"cell_voltage_min_v_avg\",\n  cellVmax: \"cell_voltage_max_v_avg\",\n  modVmin:  \"module_voltage_min_v_avg\",\n  modVmax:  \"module_voltage_max_v_avg\",\n\n  cellTmin: \"cell_temp_min_c_avg\",\n  cellTmax: \"cell_temp_max_c_avg\",\n  modTmin:  \"module_temp_min_c_avg\",\n  modTmax:  \"module_temp_max_c_avg\",\n\n  soc: \"soc_pct_avg\",\n\n  cellIdMaxT: \"cell_id_max_temp_avg\",\n  cellIdMinT: \"cell_id_min_temp_avg\",\n  modIdMaxT:  \"module_id_max_temp_avg\",\n  modIdMinT:  \"module_id_min_temp_avg\",\n\n  cellIdMaxV: \"cell_id_max_voltage_avg\",\n  cellIdMinV: \"cell_id_min_voltage_avg\",\n  modIdMaxV:  \"module_id_max_voltage_avg\",\n  modIdMinV:  \"module_id_min_voltage_avg\",\n};\n\nconst LIMITS = {\n  cellTemp: { min: 0, max: 50, unit: \"°C\" },\n  modTemp:  { min: 0, max: 50, unit: \"°C\" },\n  soc:      { min: 8, max: 98, unit: \"%\" },\n  cellVolt: { min: 3, max: 3.6, unit: \"V\" },\n\n  cellTempSpreadMax: 5,\n  modTempSpreadMax:  5,\n\n  moduleVoltSpreadMax: 0.3,\n  cellVoltSpreadMax:   0.03,\n};\n\nconst TIMEZONE = \"Europe/Prague\";\n\n// ---------- helpers ----------\nconst toNum = (v) => {\n  if (v === null || v === undefined || v === \"\") return null;\n  const n = Number(v);\n  return Number.isFinite(n) ? n : null;\n};\n\nconst toMs = (t) => {\n  const ms = Date.parse(t);\n  return Number.isFinite(ms) ? ms : null;\n};\n\nfunction pct(n, d) {\n  if (!d) return 0;\n  return Math.round((n / d) * 10000) / 100;\n}\n\nfunction tallyInc(map, v) {\n  const n = toNum(v);\n  if (n === null) return;\n  const key = String(Math.trunc(n));\n  map.set(key, (map.get(key) || 0) + 1);\n}\n\nfunction topShare(map) {\n  if (!map.size) return { topId: null, topCount: 0, topPct: 0, total: 0, breakdown: [] };\n\n  let total = 0;\n  let topId = null;\n  let topCount = -1;\n\n  for (const [k, c] of map.entries()) {\n    total += c;\n    if (c > topCount) { topCount = c; topId = k; }\n  }\n\n  const breakdown = Array.from(map.entries())\n    .sort((a,b) => b[1] - a[1])\n    .slice(0, 10)\n    .map(([id, count]) => ({ id, count, pct: pct(count, total) }));\n\n  return { topId, topCount, topPct: pct(topCount, total), total, breakdown };\n}\n\nfunction minMaxPush(state, v) {\n  if (v === null) return;\n  if (v < state.min) state.min = v;\n  if (v > state.max) state.max = v;\n}\n\nfunction pad2(n){ return String(n).padStart(2, \"0\"); }\nfunction pad3(n){ return String(n).padStart(3, \"0\"); }\n\n// ---------- timezone / DST-safe helpers for Europe/Prague ----------\nfunction getTzParts(ms, timeZone = TIMEZONE) {\n  const d = new Date(ms);\n  const dtf = new Intl.DateTimeFormat(\"en-CA\", {\n    timeZone,\n    year: \"numeric\",\n    month: \"2-digit\",\n    day: \"2-digit\",\n    hour: \"2-digit\",\n    minute: \"2-digit\",\n    second: \"2-digit\",\n    hourCycle: \"h23\",\n  });\n\n  const parts = dtf.formatToParts(d);\n  const obj = {};\n  for (const p of parts) {\n    if (p.type !== \"literal\") obj[p.type] = p.value;\n  }\n\n  return {\n    year: Number(obj.year),\n    month: Number(obj.month),\n    day: Number(obj.day),\n    hour: Number(obj.hour),\n    minute: Number(obj.minute),\n    second: Number(obj.second),\n  };\n}\n\nfunction ymdInPrague(dateNow = new Date()) {\n  const p = getTzParts(dateNow.getTime(), TIMEZONE);\n  return `${p.year}-${pad2(p.month)}-${pad2(p.day)}`;\n}\n\n/**\n * Returns timezone offset in milliseconds for given UTC timestamp in target zone.\n * Example: Prague winter -> +3600000, summer -> +7200000\n */\nfunction getOffsetMs(ms, timeZone = TIMEZONE) {\n  const p = getTzParts(ms, timeZone);\n  const utcEquivalent = Date.UTC(\n    p.year,\n    p.month - 1,\n    p.day,\n    p.hour,\n    p.minute,\n    p.second,\n    0\n  );\n  return utcEquivalent - ms;\n}\n\n/**\n * Converts local wall-clock datetime in Europe/Prague to UTC ms.\n * Handles DST automatically.\n */\nfunction zonedDateTimeToUtcMs(year, month, day, hour = 0, minute = 0, second = 0, ms = 0, timeZone = TIMEZONE) {\n  // initial guess as if local time were UTC\n  let guess = Date.UTC(year, month - 1, day, hour, minute, second, ms);\n\n  // refine with timezone offset at guessed instant\n  let offset = getOffsetMs(guess, timeZone);\n  let result = Date.UTC(year, month - 1, day, hour, minute, second, ms) - offset;\n\n  // second pass for DST boundary correctness\n  const offset2 = getOffsetMs(result, timeZone);\n  if (offset2 !== offset) {\n    result = Date.UTC(year, month - 1, day, hour, minute, second, ms) - offset2;\n  }\n\n  return result;\n}\n\nfunction makePragueMidnightMs(ymd) {\n  const [y, m, d] = ymd.split(\"-\").map(Number);\n  return zonedDateTimeToUtcMs(y, m, d, 0, 0, 0, 0, TIMEZONE);\n}\n\nfunction formatOffset(offsetMs) {\n  const sign = offsetMs >= 0 ? \"+\" : \"-\";\n  const abs = Math.abs(offsetMs);\n  const hh = pad2(Math.floor(abs / 3600000));\n  const mm = pad2(Math.floor((abs % 3600000) / 60000));\n  return `${sign}${hh}:${mm}`;\n}\n\nfunction formatPrague(ms) {\n  const p = getTzParts(ms, TIMEZONE);\n  const d = new Date(ms);\n  const milli = pad3(d.getUTCMilliseconds());\n  const offset = formatOffset(getOffsetMs(ms, TIMEZONE));\n\n  return `${p.year}-${pad2(p.month)}-${pad2(p.day)}T${pad2(p.hour)}:${pad2(p.minute)}:${pad2(p.second)}.${milli}${offset}`;\n}\n\n// duration ms -> hh:mm:ss\nfunction formatDuration(ms) {\n  if (ms === null || ms === undefined || !Number.isFinite(ms) || ms < 0) return \"\";\n  const totalSec = Math.round(ms / 1000);\n  const h = Math.floor(totalSec / 3600);\n  const m = Math.floor((totalSec % 3600) / 60);\n  const s = totalSec % 60;\n  return `${pad2(h)}:${pad2(m)}:${pad2(s)}`;\n}\n\n// ---------- rounding + formatting (for PDF stability) ----------\nfunction roundTo(v, d){\n  if (v === null || v === undefined || !Number.isFinite(v)) return null;\n  const p = 10 ** d;\n  return Math.round(v * p) / p;\n}\n\nfunction decimalsFor(unit, metric){\n  if (unit === \"V\") {\n    if (String(metric).includes(\"spread\")) return 4;\n    return 3;\n  }\n  if (unit === \"°C\") return 1;\n  if (unit === \"%\") return 1;\n  return 3;\n}\n\nfunction fmt(v, d){\n  if (v === null || v === undefined || !Number.isFinite(v)) return \"\";\n  return roundTo(v, d).toFixed(d);\n}\n\nfunction fmtSmart(v, unit, metric){\n  const d = decimalsFor(unit, metric);\n  return fmt(v, d);\n}\n\nfunction fmtRule(rule, unit, metric){\n  if (!rule) return \"\";\n  const u = rule.unit || unit || \"\";\n  const d = decimalsFor(u, metric);\n  if (rule.min !== undefined && rule.max !== undefined) {\n    return `${fmt(rule.min, d)}–${fmt(rule.max, d)} ${u}`.trim();\n  }\n  if (rule.max !== undefined) {\n    return `≤ ${fmt(rule.max, d)} ${u}`.trim();\n  }\n  return `${JSON.stringify(rule)}`;\n}\n\n/**\n * Spread-ID list formatting (compact, capped).\n */\nfunction fmtIds(idsArr, cap = 12) {\n  const ids = (idsArr || [])\n    .map(x => String(x).trim())\n    .filter(x => x.length > 0);\n\n  if (!ids.length) return \"\";\n\n  ids.sort((a,b) => {\n    const na = Number(a), nb = Number(b);\n    const fa = Number.isFinite(na), fb = Number.isFinite(nb);\n    if (fa && fb) return na - nb;\n    if (fa && !fb) return -1;\n    if (!fa && fb) return 1;\n    return a.localeCompare(b);\n  });\n\n  const shown = ids.slice(0, cap);\n  const rest = ids.length - shown.length;\n  return rest > 0\n    ? `IDs: ${shown.join(\", \")} (+${rest} dalších)`\n    : `IDs: ${shown.join(\", \")}`;\n}\n\n// ---------- load rows ----------\nconst rows = items.map(i => i.json);\n\n// ---------- define previous local day window in Europe/Prague -----\nconst todayYMD = ymdInPrague(new Date());\nconst todayStartMs = makePragueMidnightMs(todayYMD);\n\n// previous local midnight in Prague\nconst prevDayDate = new Date(todayStartMs - 1);\nconst prevYMD = ymdInPrague(prevDayDate);\nconst startMs = makePragueMidnightMs(prevYMD);\nconst endMs = todayStartMs;\n\nconst startStr = formatPrague(startMs);\nconst endStr   = formatPrague(endMs);\n\n// ---------- filter + keep parsed ms ----------\nconst windowRows = [];\nfor (let i = 0; i < rows.length; i++) {\n  const r = rows[i];\n  const t = r[COL.time];\n  if (!t) continue;\n  const ms = toMs(t);\n  if (ms === null) continue;\n  if (ms >= startMs && ms < endMs) {\n    windowRows.push({ r, ms });\n  }\n}\n\nif (!windowRows.length) {\n  return [{\n    json: {\n      ok: false,\n      error: \"No rows found in previous Prague-local day window\",\n      window: { start: startStr, end: endStr },\n    }\n  }];\n}\n\nwindowRows.sort((a,b) => a.ms - b.ms);\nconst N = windowRows.length;\n\n// ---------- accumulators ----------\nconst violatedTs = new Set();\n\nconst mmCellV = { min: Infinity, max: -Infinity };\nconst mmModV  = { min: Infinity, max: -Infinity };\nconst mmCellT = { min: Infinity, max: -Infinity };\nconst mmModT  = { min: Infinity, max: -Infinity };\nconst mmSoc   = { min: Infinity, max: -Infinity };\n\n// tallies\nconst tCellMaxT = new Map();\nconst tCellMinT = new Map();\nconst tModMaxT  = new Map();\nconst tModMinT  = new Map();\nconst tCellMaxV = new Map();\nconst tCellMinV = new Map();\nconst tModMaxV  = new Map();\nconst tModMinV  = new Map();\n\n// ---------- interval tracking ----------\nconst open = new Map();\nconst violationRanges = [];\n\nfunction makeKey(metric, type) {\n  return `${metric}::${type}`;\n}\n\nfunction addIdsFromDetailsToSet(set, details) {\n  if (!set || !details) return;\n  const idMax = details.idMax ?? null;\n  const idMin = details.idMin ?? null;\n  if (idMax !== null && idMax !== undefined && String(idMax).trim() !== \"\") set.add(String(idMax).trim());\n  if (idMin !== null && idMin !== undefined && String(idMin).trim() !== \"\") set.add(String(idMin).trim());\n}\n\nfunction startRange(metric, type, rule, unit, t, ms, value, details) {\n  const ids = new Set();\n  addIdsFromDetailsToSet(ids, details);\n\n  return {\n    metric,\n    type,\n    rule,\n    unit: unit || (rule && rule.unit) || null,\n\n    startTime: t,\n    startMs: ms,\n\n    endTime: null,\n    endMs: null,\n\n    lastBadTime: t,\n    lastBadMs: ms,\n\n    points: 1,\n\n    minValue: value,\n    maxValue: value,\n\n    worstValue: value,\n\n    ids,\n\n    openEnded: false,\n    durationMs: null,\n    duration: null,\n  };\n}\n\nfunction updateRange(rg, ms, t, value, details, isBelowType) {\n  rg.lastBadTime = t;\n  rg.lastBadMs = ms;\n  rg.points += 1;\n\n  if (value !== null && value !== undefined) {\n    if (rg.minValue === null || rg.minValue === undefined) rg.minValue = value;\n    if (rg.maxValue === null || rg.maxValue === undefined) rg.maxValue = value;\n\n    if (value < rg.minValue) rg.minValue = value;\n    if (value > rg.maxValue) rg.maxValue = value;\n\n    if (isBelowType) {\n      if (rg.worstValue === null || value < rg.worstValue) rg.worstValue = value;\n    } else {\n      if (rg.worstValue === null || value > rg.worstValue) rg.worstValue = value;\n    }\n  }\n\n  addIdsFromDetailsToSet(rg.ids, details);\n}\n\nfunction closeRange(key, resolvedTime, resolvedMs) {\n  const rg = open.get(key);\n  if (!rg) return;\n\n  rg.endTime = resolvedTime;\n  rg.endMs = resolvedMs;\n\n  rg.durationMs = rg.endMs - rg.startMs;\n  rg.duration = formatDuration(rg.durationMs);\n\n  violationRanges.push(rg);\n  open.delete(key);\n}\n\nfunction track(metric, type, isBad, t, ms, value, rule, unit, details) {\n  const key = makeKey(metric, type);\n  const isBelow = (type === \"below_min\");\n  const isActive = open.has(key);\n\n  if (isBad) {\n    if (!isActive) {\n      open.set(key, startRange(metric, type, rule, unit, t, ms, value, details));\n    } else {\n      updateRange(open.get(key), ms, t, value, details, isBelow);\n    }\n  } else {\n    if (isActive) closeRange(key, t, ms);\n  }\n}\n\n// ---------- single pass checks ----------\nfor (let i = 0; i < N; i++) {\n  const row = windowRows[i].r;\n  const ms = windowRows[i].ms;\n  const t = row[COL.time];\n\n  let anyBadThisRow = false;\n\n  const cTmin = toNum(row[COL.cellTmin]);\n  const cTmax = toNum(row[COL.cellTmax]);\n  const mTmin = toNum(row[COL.modTmin]);\n  const mTmax = toNum(row[COL.modTmax]);\n\n  const cVmin = toNum(row[COL.cellVmin]);\n  const cVmax = toNum(row[COL.cellVmax]);\n  const mVmin = toNum(row[COL.modVmin]);\n  const mVmax = toNum(row[COL.modVmax]);\n\n  const s = toNum(row[COL.soc]);\n\n  minMaxPush(mmCellV, cVmin); minMaxPush(mmCellV, cVmax);\n  minMaxPush(mmModV,  mVmin); minMaxPush(mmModV,  mVmax);\n  minMaxPush(mmCellT, cTmin); minMaxPush(mmCellT, cTmax);\n  minMaxPush(mmModT,  mTmin); minMaxPush(mmModT,  mTmax);\n  minMaxPush(mmSoc,   s);\n\n  const cTminBad = (cTmin !== null && cTmin < LIMITS.cellTemp.min);\n  const cTmaxBad = (cTmax !== null && cTmax > LIMITS.cellTemp.max);\n  track(\"cell_temp_min\", \"below_min\", cTminBad, t, ms, cTmin, LIMITS.cellTemp, \"°C\");\n  track(\"cell_temp_max\", \"above_max\", cTmaxBad, t, ms, cTmax, LIMITS.cellTemp, \"°C\");\n  if (cTminBad || cTmaxBad) anyBadThisRow = true;\n\n  const mTminBad = (mTmin !== null && mTmin < LIMITS.modTemp.min);\n  const mTmaxBad = (mTmax !== null && mTmax > LIMITS.modTemp.max);\n  track(\"module_temp_min\", \"below_min\", mTminBad, t, ms, mTmin, LIMITS.modTemp, \"°C\");\n  track(\"module_temp_max\", \"above_max\", mTmaxBad, t, ms, mTmax, LIMITS.modTemp, \"°C\");\n  if (mTminBad || mTmaxBad) anyBadThisRow = true;\n\n  const socLow = (s !== null && s < LIMITS.soc.min);\n  const socHigh = (s !== null && s > LIMITS.soc.max);\n  track(\"soc\", \"below_min\", socLow, t, ms, s, LIMITS.soc, \"%\");\n  track(\"soc\", \"above_max\", socHigh, t, ms, s, LIMITS.soc, \"%\");\n  if (socLow || socHigh) anyBadThisRow = true;\n\n  const cVminBad = (cVmin !== null && cVmin < LIMITS.cellVolt.min);\n  const cVmaxBad = (cVmax !== null && cVmax > LIMITS.cellVolt.max);\n  track(\"cell_voltage_min\", \"below_min\", cVminBad, t, ms, cVmin, LIMITS.cellVolt, \"V\");\n  track(\"cell_voltage_max\", \"above_max\", cVmaxBad, t, ms, cVmax, LIMITS.cellVolt, \"V\");\n  if (cVminBad || cVmaxBad) anyBadThisRow = true;\n\n  if (cTmin !== null && cTmax !== null) {\n    const spread = cTmax - cTmin;\n    const bad = spread > LIMITS.cellTempSpreadMax;\n    track(\n      \"cell_temp_spread\",\n      \"spread_exceeded\",\n      bad,\n      t,\n      ms,\n      spread,\n      { max: LIMITS.cellTempSpreadMax, unit: \"°C\" },\n      \"°C\",\n      bad ? { idMax: row[COL.cellIdMaxT] ?? null, idMin: row[COL.cellIdMinT] ?? null } : null\n    );\n    if (bad) anyBadThisRow = true;\n  } else {\n    track(\"cell_temp_spread\", \"spread_exceeded\", false, t, ms, null, { max: LIMITS.cellTempSpreadMax, unit: \"°C\" }, \"°C\");\n  }\n\n  if (mTmin !== null && mTmax !== null) {\n    const spread = mTmax - mTmin;\n    const bad = spread > LIMITS.modTempSpreadMax;\n    track(\n      \"module_temp_spread\",\n      \"spread_exceeded\",\n      bad,\n      t,\n      ms,\n      spread,\n      { max: LIMITS.modTempSpreadMax, unit: \"°C\" },\n      \"°C\",\n      bad ? { idMax: row[COL.modIdMaxT] ?? null, idMin: row[COL.modIdMinT] ?? null } : null\n    );\n    if (bad) anyBadThisRow = true;\n  } else {\n    track(\"module_temp_spread\", \"spread_exceeded\", false, t, ms, null, { max: LIMITS.modTempSpreadMax, unit: \"°C\" }, \"°C\");\n  }\n\n  if (mVmin !== null && mVmax !== null) {\n    const spread = mVmax - mVmin;\n    const bad = spread > LIMITS.moduleVoltSpreadMax;\n    track(\n      \"module_voltage_spread\",\n      \"spread_exceeded\",\n      bad,\n      t,\n      ms,\n      spread,\n      { max: LIMITS.moduleVoltSpreadMax, unit: \"V\" },\n      \"V\",\n      bad ? { idMax: row[COL.modIdMaxV] ?? null, idMin: row[COL.modIdMinV] ?? null } : null\n    );\n    if (bad) anyBadThisRow = true;\n  } else {\n    track(\"module_voltage_spread\", \"spread_exceeded\", false, t, ms, null, { max: LIMITS.moduleVoltSpreadMax, unit: \"V\" }, \"V\");\n  }\n\n  if (cVmin !== null && cVmax !== null) {\n    const spread = cVmax - cVmin;\n    const bad = spread > LIMITS.cellVoltSpreadMax;\n    track(\n      \"cell_voltage_spread\",\n      \"spread_exceeded\",\n      bad,\n      t,\n      ms,\n      spread,\n      { max: LIMITS.cellVoltSpreadMax, unit: \"V\" },\n      \"V\",\n      bad ? { idMax: row[COL.cellIdMaxV] ?? null, idMin: row[COL.cellIdMinV] ?? null } : null\n    );\n    if (bad) anyBadThisRow = true;\n  } else {\n    track(\"cell_voltage_spread\", \"spread_exceeded\", false, t, ms, null, { max: LIMITS.cellVoltSpreadMax, unit: \"V\" }, \"V\");\n  }\n\n  if (anyBadThisRow) violatedTs.add(t);\n\n  tallyInc(tCellMaxT, row[COL.cellIdMaxT]);\n  tallyInc(tCellMinT, row[COL.cellIdMinT]);\n  tallyInc(tModMaxT,  row[COL.modIdMaxT]);\n  tallyInc(tModMinT,  row[COL.modIdMinT]);\n\n  tallyInc(tCellMaxV, row[COL.cellIdMaxV]);\n  tallyInc(tCellMinV, row[COL.cellIdMinV]);\n  tallyInc(tModMaxV,  row[COL.modIdMaxV]);\n  tallyInc(tModMinV,  row[COL.modIdMinV]);\n}\n\n// Close any still-open violations at window end\nfor (const [key, rg] of open.entries()) {\n  rg.endTime = endStr;\n  rg.endMs = endMs;\n  rg.openEnded = true;\n  rg.durationMs = rg.endMs - rg.startMs;\n  rg.duration = formatDuration(rg.durationMs);\n  violationRanges.push(rg);\n}\nopen.clear();\n\nfunction finalizeMM(mm) {\n  if (mm.min === Infinity) return { min: null, max: null };\n  return { min: mm.min, max: mm.max };\n}\n\nconst top = {\n  cell_max_temp: topShare(tCellMaxT),\n  cell_min_temp: topShare(tCellMinT),\n  mod_max_temp:  topShare(tModMaxT),\n  mod_min_temp:  topShare(tModMinT),\n  cell_max_volt: topShare(tCellMaxV),\n  cell_min_volt: topShare(tCellMinV),\n  mod_max_volt:  topShare(tModMaxV),\n  mod_min_volt:  topShare(tModMinV),\n};\n\nconst violationRangesOut = violationRanges.map(v => {\n  const unit = v.unit || (v.rule && v.rule.unit) || null;\n  const d = decimalsFor(unit, v.metric);\n\n  const idsText = (v.type === \"spread_exceeded\" && v.ids && v.ids.size)\n    ? fmtIds(Array.from(v.ids), 12)\n    : \"\";\n\n  return {\n    metric: v.metric,\n    type: v.type,\n\n    startTime: v.startTime,\n    endTime: v.endTime,\n    openEnded: !!v.openEnded,\n    duration: v.duration,\n    points: v.points,\n\n    unit,\n\n    worstValue: roundTo(v.worstValue, d),\n    minValue: roundTo(v.minValue, d),\n    maxValue: roundTo(v.maxValue, d),\n\n    worstText: `${fmtSmart(v.worstValue, unit, v.metric)}${unit ? \" \" + unit : \"\"}`.trim(),\n    minText: fmtSmart(v.minValue, unit, v.metric),\n    maxText: fmtSmart(v.maxValue, unit, v.metric),\n    ruleText: fmtRule(v.rule, unit, v.metric),\n\n    detailsText: idsText,\n  };\n});\n\nconst summary = {\n  window: { start: startStr, end: endStr, points: N },\n\n  cell_voltage:   { ...finalizeMM(mmCellV), unit: \"V\" },\n  module_voltage: { ...finalizeMM(mmModV),  unit: \"V\" },\n  cell_temp:      { ...finalizeMM(mmCellT), unit: \"°C\" },\n  module_temp:    { ...finalizeMM(mmModT),  unit: \"°C\" },\n  soc:            { ...finalizeMM(mmSoc),   unit: \"%\" },\n\n  counts: {\n    totalViolations: violationRangesOut.length,\n    violatedTimestamps: violatedTs.size,\n  }\n};\n\nreturn [{\n  json: {\n    ok: true,\n    limits: LIMITS,\n    summary,\n    violationRanges: violationRangesOut,\n    top,\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        368,
+        -256
+      ],
+      "id": "774aab56-c419-48f3-97e1-830d9e4eb1fd",
+      "name": "Kontrola limitů a zpracování dat pro report"
+    },
+    {
+      "parameters": {
+        "html": "<!doctype html>\n<html lang=\"cs\">\n<head>\n  <meta charset=\"utf-8\" />\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n  <title>24h zpráva o limitech BESS</title>\n\n  <style>\n    :root{\n      --bg:#ffffff;\n      --card:#ffffff;\n      --muted:#4b5563;\n      --text:#0b1220;\n      --line:rgba(2,6,23,.15);\n      --good:#16a34a;\n      --bad:#dc2626;\n      --warn:#f59e0b;\n      --pill:#f3f4f6;\n      --sans: Arial, Helvetica, \"Liberation Sans\", sans-serif;\n      --mono: \"Courier New\", Courier, monospace;\n    }\n\n    *{box-sizing:border-box}\n    body{\n      margin:0;\n      font-family:var(--sans);\n      color:var(--text);\n      background: linear-gradient(180deg, #ffffff, #f8fafc 40%, #ffffff);\n      -webkit-print-color-adjust: exact;\n      print-color-adjust: exact;\n    }\n\n    /* IMPORTANT: don’t constrain PDF width */\n    .page{\n      width: 100%;\n      max-width: none;\n      margin: 0 auto;\n      padding: 28px 22px 40px;\n    }\n\n    .header{\n      display:flex;\n      align-items:flex-start;\n      justify-content:space-between;\n      gap:16px;\n      margin-bottom:18px;\n    }\n\n    .title h1{\n      margin:0;\n      font-size:22px;\n      letter-spacing:.2px;\n    }\n\n    .subtitle{\n      margin-top:6px;\n      color:var(--muted);\n      font-size:12.5px;\n      line-height:1.35;\n    }\n\n    .badge{\n      display:inline-flex;\n      align-items:center;\n      gap:8px;\n      padding:10px 12px;\n      border-radius:14px;\n      background: #ffffff;\n      border:1px solid var(--line);\n      min-width: 260px;\n      justify-content:space-between;\n      box-shadow: 0 8px 22px rgba(2,6,23,.06);\n    }\n\n    .badge .state{\n      font-weight:700;\n      letter-spacing:.3px;\n      font-size:12px;\n      text-transform:uppercase;\n    }\n\n    .pill{\n      font-family:var(--mono);\n      font-size:11px;\n      padding:1px 5px;\n      border-radius:999px;\n      background: var(--pill);\n      border:1px solid var(--line);\n      color:var(--text);\n      white-space:nowrap;\n    }\n\n    .grid{\n      display:grid;\n      grid-template-columns: repeat(12, 1fr);\n      gap:12px;\n      margin-top:14px;\n    }\n\n    .card{\n      grid-column: span 6;\n      background: #ffffff;\n      border:1px solid var(--line);\n      border-radius:16px;\n      padding:14px 14px 12px;\n      box-shadow: 0 10px 26px rgba(2,6,23,.06);\n      backdrop-filter: none;\n    }\n\n    .card h2{\n      margin:0 0 10px;\n      font-size:13px;\n      letter-spacing:.2px;\n      color: var(--text);\n      display:flex;\n      align-items:center;\n      justify-content:space-between;\n      gap:10px;\n    }\n\n    .kpis{\n      display:grid;\n      grid-template-columns: repeat(12, 1fr);\n      gap:10px;\n    }\n\n    .kpi{\n      grid-column: span 6;\n      padding:10px 10px 9px;\n      border-radius:14px;\n      border:1px solid var(--line);\n      background: #f8fafc;\n    }\n\n    .kpi .label{\n      font-size:11px;\n      color:var(--muted);\n      margin-bottom:6px;\n    }\n\n    .kpi .value{\n      font-family:var(--mono);\n      font-size:13px;\n      line-height:1.35;\n      display:flex;\n      justify-content:space-between;\n      gap:10px;\n    }\n\n    .muted{ color: var(--muted); }\n    .small{ font-size:11px; }\n    .right{ text-align:right; }\n\n    /* generic tables */\n    table{\n      width:100%;\n      border-collapse: separate;\n      border-spacing: 0;\n      overflow:hidden;\n      border-radius:14px;\n      border:1px solid var(--line);\n      background: #ffffff;\n      table-layout: fixed; /* PDF stability */\n    }\n\n    th, td{\n      padding:10px 10px;\n      font-size:12px;\n      border-bottom:1px solid var(--line);\n      vertical-align:top;\n      overflow-wrap:anywhere;\n      word-break: break-word;\n    }\n\n    th{\n      text-align:left;\n      color:var(--text);\n      font-weight:700;\n      background: #f8fafc;\n    }\n\n    tr:last-child td{ border-bottom:none; }\n\n    td code{\n      font-family:var(--mono);\n      font-size:11.5px;\n      color:var(--text);\n      white-space: nowrap;\n    }\n\n    .section{\n      margin-top:16px;\n    }\n\n    .section-title{\n      display:flex;\n      align-items:center;\n      justify-content:space-between;\n      margin: 0 0 10px;\n      gap:10px;\n    }\n\n    .section-title h3{\n      margin:0;\n      font-size:13px;\n      color:var(--text);\n      letter-spacing:.2px;\n    }\n\n    .okdot, .baddot, .warndot{\n      width:10px;height:10px;border-radius:999px;display:inline-block;\n      margin-right:8px;\n    }\n    .okdot{ background: var(--good); box-shadow: 0 0 0 3px rgba(22,163,74,.15); }\n    .baddot{ background: var(--bad); box-shadow: 0 0 0 3px rgba(220,38,38,.15); }\n    .warndot{ background: var(--warn); box-shadow: 0 0 0 3px rgba(245,158,11,.15); }\n\n    .row2{\n      display:grid;\n      grid-template-columns: 1fr 1fr;\n      gap:12px;\n    }\n\n    .footer{\n      margin-top:18px;\n      padding-top:12px;\n      border-top:1px dashed var(--line);\n      color:var(--muted);\n      font-size:11px;\n      display:flex;\n      justify-content:space-between;\n      gap:12px;\n      flex-wrap:wrap;\n    }\n\n    /* ===== VIOLATIONS TABLE (PDF-safe) ===== */\n    .viol-table{ table-layout: fixed; }\n    .viol-table th, .viol-table td{\n      padding: 8px 10px;\n      line-height: 1.25;\n      font-size: 12px;\n      vertical-align: top;\n    }\n    .viol-table td code{\n      font-size: 11px;\n      white-space: nowrap;\n    }\n    .viol-table .wrap code{\n      white-space: normal; /* allow wrap for details */\n    }\n    .viol-table .mutedline{\n      margin-top: 3px;\n      font-size: 11px;\n      line-height: 1.2;\n      color: var(--muted);\n    }\n    .viol-pill{\n      display:inline-block;\n      padding:2px 8px;\n      border-radius:999px;\n      border:1px solid var(--line);\n      background: var(--pill);\n      font-family: var(--mono);\n      font-size: 10.5px;\n      white-space: nowrap;\n    }\n    .viol-strong{ font-weight: 700; }\n\n    /* Print / pagination rules: ONLY prevent splitting rows & table header repeats */\n    thead{ display: table-header-group; }\n    tfoot{ display: table-footer-group; }\n    tr{ break-inside: avoid; page-break-inside: avoid; }\n\n    @page {\n      size: A4;\n      margin: 22mm 14mm 18mm 14mm;\n    }\n\n    @media print{\n      body{ background:#fff; color:#0b1220; }\n      .page{ padding: 0; }\n      .card{ background:#fff; box-shadow:none; }\n      table{ background:#fff; }\n      .badge{ background:#fff; box-shadow:none; }\n\n      /* stabilize layout for printing: stack cards */\n      .grid, .row2{ display:block; }\n      .card{ margin-bottom:12mm; }\n\n      /* slightly smaller timestamps to fit */\n      td:nth-child(1) code,\n      td:nth-child(2) code{ font-size: 10.5px; }\n    }\n\n    /* Keep section title with the content right after it */\n.section-title{\n  break-after: avoid;\n  page-break-after: avoid;\n}\n\n/* Extra safety: don't allow a page break right after the title wrapper */\n.section-title + *{\n  break-before: avoid;\n  page-break-before: avoid;\n}\n    /* Annex tables: keep whole card + table together (no splits) */\n.annex-card,\n.annex-card table{\n  break-inside: avoid !important;\n  page-break-inside: avoid !important;\n}\n\n/* If your PDF engine ignores table break rules, force wrapper as the unit */\n.annex-card{\n  display: block;\n}\n    /* Rounded wrapper for violations */\n.viol-wrapper{\n  border:1px solid var(--line);\n  border-radius:14px;\n  overflow:hidden;          /* IMPORTANT */\n  background:#fff;\n}\n\n/* Remove outer border from table itself */\n.viol-table{\n  border:none;\n  border-radius:0;\n}\n  </style>\n</head>\n\n<body>\n  <div class=\"page\">\n\n    <!-- HLAVIČKA -->\n    <div class=\"header\">\n      <div class=\"title\">\n        <h1>24h zpráva o limitech BESS</h1>\n        <div class=\"subtitle\">\n          Okno hodnocení:\n          <span class=\"pill\">{{$json.summary.window.start}}</span>\n          ->\n          <span class=\"pill\">{{$json.summary.window.end}}</span>\n          <br/>\n          Počet časových okamžiků s porušením: <span class=\"pill\">{{$json.summary.counts.violatedTimestamps}}</span>\n        </div>\n      </div>\n\n      <!-- STAVOVÝ ŠTÍTEK -->\n      <div class=\"badge\">\n        <div>\n          <div class=\"state\">\n            {{ $json.summary.counts.totalViolations === 0 ? 'VYHOVUJÍCÍ' : 'NEVYHOVUJÍCÍ' }}\n          </div>\n          <div class=\"subtitle\" style=\"margin:6px 0 0;\">\n            Celkový počet porušení: <span class=\"pill\">{{$json.summary.counts.totalViolations}}</span>\n          </div>\n        </div>\n        <div style=\"display:flex; align-items:center; gap:10px;\">\n          <span class=\"{{ $json.summary.counts.totalViolations === 0 ? 'okdot' : 'baddot' }}\"></span>\n          <span class=\"pill\">{{ $json.ok ? 'OK' : 'CHYBA' }}</span>\n        </div>\n      </div>\n    </div>\n\n    <!-- KPI -->\n    <div class=\"grid\">\n      <div class=\"card\" style=\"grid-column: span 7;\">\n        <h2>Provozní rozsah <span class=\"pill\">Souhrn</span></h2>\n\n        <div class=\"kpis\">\n          <div class=\"kpi\">\n            <div class=\"label\">Napětí článků ({{$json.summary.cell_voltage.unit}})</div>\n            <div class=\"value\">\n              <span><code>min</code> {{$json.summary.cell_voltage.min}}</span>\n              <span class=\"muted\">-></span>\n              <span><code>max</code> {{$json.summary.cell_voltage.max}}</span>\n            </div>\n          </div>\n\n          <div class=\"kpi\">\n            <div class=\"label\">Napětí modulů ({{$json.summary.module_voltage.unit}})</div>\n            <div class=\"value\">\n              <span><code>min</code> {{$json.summary.module_voltage.min}}</span>\n              <span class=\"muted\">-></span>\n              <span><code>max</code> {{$json.summary.module_voltage.max}}</span>\n            </div>\n          </div>\n\n          <div class=\"kpi\">\n            <div class=\"label\">Teplota článků ({{$json.summary.cell_temp.unit}})</div>\n            <div class=\"value\">\n              <span><code>min</code> {{$json.summary.cell_temp.min}}</span>\n              <span class=\"muted\">-></span>\n              <span><code>max</code> {{$json.summary.cell_temp.max}}</span>\n            </div>\n          </div>\n\n          <div class=\"kpi\">\n            <div class=\"label\">Teplota modulů ({{$json.summary.module_temp.unit}})</div>\n            <div class=\"value\">\n              <span><code>min</code> {{$json.summary.module_temp.min}}</span>\n              <span class=\"muted\">-></span>\n              <span><code>max</code> {{$json.summary.module_temp.max}}</span>\n            </div>\n          </div>\n\n          <div class=\"kpi\" style=\"grid-column: span 12;\">\n            <div class=\"label\">SOC ({{$json.summary.soc.unit}})</div>\n            <div class=\"value\">\n              <span><code>min</code> {{$json.summary.soc.min}}</span>\n              <span class=\"muted\">-></span>\n              <span><code>max</code> {{$json.summary.soc.max}}</span>\n            </div>\n          </div>\n        </div>\n      </div>\n\n      <!-- LIMITY -->\n      <div class=\"card\" style=\"grid-column: span 5;\">\n        <h2>Použité limity</h2>\n\n        <table>\n          <thead>\n            <tr>\n              <th>Veličina</th>\n              <th class=\"right\">Limit</th>\n            </tr>\n          </thead>\n          <tbody>\n            <tr><td>Teplota článků</td><td class=\"right\"><code>{{$json.limits.cellTemp.min}}–{{$json.limits.cellTemp.max}}</code> {{$json.limits.cellTemp.unit}}</td></tr>\n            <tr><td>Teplota modulů</td><td class=\"right\"><code>{{$json.limits.modTemp.min}}–{{$json.limits.modTemp.max}}</code> {{$json.limits.modTemp.unit}}</td></tr>\n            <tr><td>SOC</td><td class=\"right\"><code>{{$json.limits.soc.min}}–{{$json.limits.soc.max}}</code> {{$json.limits.soc.unit}}</td></tr>\n            <tr><td>Bezpečné napětí článků</td><td class=\"right\"><code>{{$json.limits.cellVolt.min}}–{{$json.limits.cellVolt.max}}</code> {{$json.limits.cellVolt.unit}}</td></tr>\n            <tr><td>Rozdíl teplot článků</td><td class=\"right\"><code>≤ {{$json.limits.cellTempSpreadMax}}</code> °C</td></tr>\n            <tr><td>Rozdíl teplot modulů</td><td class=\"right\"><code>≤ {{$json.limits.modTempSpreadMax}}</code> °C</td></tr>\n            <tr><td>Rozdíl napětí článků</td><td class=\"right\"><code>≤ {{$json.limits.cellVoltSpreadMax}}</code> V</td></tr>\n            <tr><td>Rozdíl napětí modulů</td><td class=\"right\"><code>≤ {{$json.limits.moduleVoltSpreadMax}}</code> V</td></tr>\n          </tbody>\n        </table>\n      </div>\n    </div>\n\n<!-- PORUŠENÍ (intervaly) -->\n<div class=\"section\">\n  <div class=\"section-title\">\n    <h3>Porušení limitů (intervaly)</h3>\n    <span class=\"pill\">{{ $json.violationRanges.length }} intervalů</span>\n  </div>\n\n  {{ $json.violationRanges.length === 0\n    ? `<div class=\"card\" style=\"padding:14px; border-radius:16px;\">\n        <span class=\"okdot\"></span>\n        <strong>Všechny kontroly prošly.</strong>\n        <div class=\"subtitle\" style=\"margin-top:6px;\">\n          Ve zvoleném 24hodinovém okně nebylo zjištěno žádné porušení mezních hodnot.\n        </div>\n      </div>`\n    : `<div class=\"viol-wrapper\">\n        <table class=\"viol-table\">\n          <thead>\n            <tr>\n              <th style=\"width:190px;\">Čas (Od – Do)</th>\n              <th style=\"width:150px;\">Veličina</th>\n              <th style=\"width:92px;\">Trvání</th>\n              <th style=\"width:160px;\">Extrém</th>\n              <th>Pravidlo / detaily</th>\n            </tr>\n          </thead>\n          <tbody>\n            ${$json.violationRanges.map(v => `\n              <tr>\n                <td>\n                  <code>${v.startTime}</code><br/>\n                  <code>${v.endTime}</code>\n                  ${v.openEnded ? `<div class=\"mutedline\">(neukončeno v okně)</div>` : ``}\n                </td>\n\n                <td>\n                  <div><span class=\"viol-pill\">${v.metric}</span></div>\n                  <div style=\"margin-top:4px;\"><span class=\"viol-pill\">${v.type}</span></div>\n                </td>\n\n                <td><code>${v.duration || \"\"}</code></td>\n\n                <td>\n                  <div class=\"viol-strong\"><code>${v.worstText}</code></div>\n                  <div class=\"mutedline\">\n                    min: <code>${v.minText}</code> · max: <code>${v.maxText}</code>\n                  </div>\n                </td>\n\n                <td class=\"wrap\">\n                  <div class=\"mutedline\"><span class=\"muted\">limit:</span> <code>${v.ruleText}</code></div>\n                  ${v.detailsText ? `<div class=\"mutedline\"><span class=\"muted\">detaily:</span> <code>${v.detailsText}</code></div>` : ``}\n                </td>\n              </tr>\n            `).join('')}\n          </tbody>\n        </table>\n      </div>`\n  }}\n</div>\n    <!-- DOMINANCE -->\n    <div class=\"section\">\n      <div class=\"section-title\">\n        <h3>Dominance (články a moduly s největšími a nejmenšími hodnotami)</h3>\n      </div>\n\n      <div class=\"row2\">\n        <!-- TEPLOTA -->\n        <div class=\"card\">\n          <h2>Teplotní statistiky</h2>\n          <table>\n            <thead>\n              <tr><th>Kategorie</th><th class=\"right\">Sériové číslo</th><th class=\"right\">Podíl</th></tr>\n            </thead>\n            <tbody>\n              <tr><td>Článek s max. teplotou</td><td class=\"right\"><code>{{$json.top.cell_max_temp.topId}}</code></td><td class=\"right\"><code>{{$json.top.cell_max_temp.topPct}}%</code></td></tr>\n              <tr><td>Článek s min. teplotou</td><td class=\"right\"><code>{{$json.top.cell_min_temp.topId}}</code></td><td class=\"right\"><code>{{$json.top.cell_min_temp.topPct}}%</code></td></tr>\n              <tr><td>Modul s max. teplotou</td><td class=\"right\"><code>{{$json.top.mod_max_temp.topId}}</code></td><td class=\"right\"><code>{{$json.top.mod_max_temp.topPct}}%</code></td></tr>\n              <tr><td>Modul s min. teplotou</td><td class=\"right\"><code>{{$json.top.mod_min_temp.topId}}</code></td><td class=\"right\"><code>{{$json.top.mod_min_temp.topPct}}%</code></td></tr>\n            </tbody>\n          </table>\n        </div>\n\n        <!-- NAPĚTÍ -->\n        <div class=\"card\">\n          <h2>Napěťová statistiky</h2>\n          <table>\n            <thead>\n              <tr><th>Kategorie</th><th class=\"right\">Sériové číslo</th><th class=\"right\">Podíl</th></tr>\n            </thead>\n            <tbody>\n              <tr><td>Článek s max. napětím</td><td class=\"right\"><code>{{$json.top.cell_max_volt.topId}}</code></td><td class=\"right\"><code>{{$json.top.cell_max_volt.topPct}}%</code></td></tr>\n              <tr><td>Článek s min. napětím</td><td class=\"right\"><code>{{$json.top.cell_min_volt.topId}}</code></td><td class=\"right\"><code>{{$json.top.cell_min_volt.topPct}}%</code></td></tr>\n              <tr><td>Modul s max. napětím</td><td class=\"right\"><code>{{$json.top.mod_max_volt.topId}}</code></td><td class=\"right\"><code>{{$json.top.mod_max_volt.topPct}}%</code></td></tr>\n              <tr><td>Modul s min. napětím</td><td class=\"right\"><code>{{$json.top.mod_min_volt.topId}}</code></td><td class=\"right\"><code>{{$json.top.mod_min_volt.topPct}}%</code></td></tr>\n            </tbody>\n          </table>\n        </div>\n      </div>\n    </div>\n\n    <!-- PŘÍLOHA: ROZPADY -->\n    <div class=\"section\">\n      <div class=\"section-title\">\n        <h3>Příloha: Statistiky podle provozní doby na okrajových hodnotách</h3>\n      </div>\n\n      <div class=\"row2\">\n        <div class=\"card annex-card\">\n          <h2>Rozdělení max. napětí článků</h2>\n          <table>\n            <thead>\n              <tr><th>Sériové číslo</th><th class=\"right\">Počet bodů</th><th class=\"right\">Podíl</th></tr>\n            </thead>\n            <tbody>\n              {{ $json.top.cell_max_volt.breakdown.map(x => `\n                <tr>\n                  <td><code>${x.id}</code></td>\n                  <td class=\"right\"><code>${x.count}</code></td>\n                  <td class=\"right\"><code>${x.pct}%</code></td>\n                </tr>`).join('') }}\n            </tbody>\n          </table>\n        </div>\n\n        <div class=\"card annex-card\">\n          <h2>Rozdělení min. napětí modulů</h2>\n          <table>\n            <thead>\n              <tr><th>Sériové číslo</th><th class=\"right\">Počet bodů</th><th class=\"right\">Podíl</th></tr>\n            </thead>\n            <tbody>\n              {{ $json.top.mod_min_volt.breakdown.map(x => `\n                <tr>\n                  <td><code>${x.id}</code></td>\n                  <td class=\"right\"><code>${x.count}</code></td>\n                  <td class=\"right\"><code>${x.pct}%</code></td>\n                </tr>`).join('') }}\n            </tbody>\n          </table>\n        </div>\n      </div>\n\n      <div class=\"row2\" style=\"margin-top:12px;\">\n        <div class=\"card annex-card\">\n          <h2>Rozdělení min. napětí článků</h2>\n          <table>\n            <thead>\n              <tr><th>Sériové číslo</th><th class=\"right\">Počet bodů</th><th class=\"right\">Podíl</th></tr>\n            </thead>\n            <tbody>\n              {{ $json.top.cell_min_volt.breakdown.map(x => `\n                <tr>\n                  <td><code>${x.id}</code></td>\n                  <td class=\"right\"><code>${x.count}</code></td>\n                  <td class=\"right\"><code>${x.pct}%</code></td>\n                </tr>`).join('') }}\n            </tbody>\n          </table>\n        </div>\n\n        <div class=\"card annex-card\">\n          <h2>Rozdělení max. napětí modulů</h2>\n          <table>\n            <thead>\n              <tr><th>Sériové číslo</th><th class=\"right\">Počet bodů</th><th class=\"right\">Podíl</th></tr>\n            </thead>\n            <tbody>\n              {{ $json.top.mod_max_volt.breakdown.map(x => `\n                <tr>\n                  <td><code>${x.id}</code></td>\n                  <td class=\"right\"><code>${x.count}</code></td>\n                  <td class=\"right\"><code>${x.pct}%</code></td>\n                </tr>`).join('') }}\n            </tbody>\n          </table>\n        </div>\n      </div>\n    </div>\n\n    <!-- PATIČKA -->\n    <div class=\"footer\">\n      <div>Generováno v n8n</div>\n      <div class=\"right\">ID zprávy: <span class=\"pill\">{{ new Date().toISOString() }}</span></div>\n    </div>\n\n  </div>\n</body>\n</html>"
+      },
+      "type": "n8n-nodes-base.html",
+      "typeVersion": 1.2,
+      "position": [
+        592,
+        -256
+      ],
+      "id": "981f508b-63a7-45aa-81f9-aa9cfcd9f27d",
+      "name": "Vizualizace dat v HTML"
+    },
+    {
+      "parameters": {
+        "sendTo": "257997@vutbr.cz",
+        "subject": "=Report BESS {{ $now.setZone('Europe/Prague').minus({ days: 1 }).toFormat('yyyy-LL-dd') }}\n",
+        "message": "=",
+        "options": {
+          "attachmentsUi": {
+            "attachmentsBinary": [
+              {}
+            ]
+          }
+        }
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1040,
+        -160
+      ],
+      "id": "dd19510f-1dfc-4a46-8e9a-a7d3e775789e",
+      "name": "Odeslání reportu na e-mail",
+      "webhookId": "5f8e268d-42b4-438f-9302-b87bae3e3157",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "name": "=Report {{ $now.setZone('Europe/Prague').minus({ days: 1 }).toFormat('yyyy-LL-dd') }}\n",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "value": "1gfeTjYfMdlMLSK5kwZ-T_nRqQdoQK3sB",
+          "mode": "list",
+          "cachedResultName": "n8n_BESS_reporty",
+          "cachedResultUrl": "https://drive.google.com/drive/folders/1gfeTjYfMdlMLSK5kwZ-T_nRqQdoQK3sB"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        1040,
+        -352
+      ],
+      "id": "c3b138f9-9b0c-438a-b236-f185b426739a",
+      "name": "Záloha na Google drive",
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "clear",
+        "documentId": {
+          "__rl": true,
+          "value": "1SwINCHsHh3krQJJq6sMQxNNW2w1G3VTS_q0HTx-LLLQ",
+          "mode": "list",
+          "cachedResultName": "N8N databáze",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1SwINCHsHh3krQJJq6sMQxNNW2w1G3VTS_q0HTx-LLLQ/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "List 1",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1SwINCHsHh3krQJJq6sMQxNNW2w1G3VTS_q0HTx-LLLQ/edit#gid=0"
+        },
+        "clear": "specificRange",
+        "range": "A2:T"
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        1296,
+        -160
+      ],
+      "id": "cad736c6-cf50-432d-aaaf-b4fe669408f2",
+      "name": "Clear sheet",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "htmlInput": "={{ $json.html }}",
+        "outputFilename": "=Report {{ $now.setZone('Europe/Prague').minus({ days: 1 }).toFormat('yyyy-LL-dd') }}.pdf"
+      },
+      "type": "@custom-js/n8n-nodes-pdf-toolkit.html2Pdf",
+      "typeVersion": 1,
+      "position": [
+        816,
+        -256
+      ],
+      "id": "8488b4de-5b48-4f66-a6f4-af4d1ea3ef7a",
+      "name": "HTML to PDF",
+      "credentials": {
+        "customJsApi": {
+          "id": "",
+          "name": "CustomJS account"
+        }
+      }
+    }
+  ],
+  "pinData": {
+    "Spuštění jednou za 24 hodin": [
+      {
+        "json": {
+          "timestamp": "2026-02-07T18:36:17.310+01:00",
+          "Readable date": "February 7th 2026, 6:36:17 pm",
+          "Readable time": "6:36:17 pm",
+          "Day of week": "Saturday",
+          "Year": "2026",
+          "Month": "February",
+          "Day of month": "07",
+          "Hour": "18",
+          "Minute": "36",
+          "Second": "17",
+          "Timezone": "Europe/Berlin (UTC+01:00)"
+        },
+        "pairedItem": {
+          "item": 0
+        }
+      }
+    ]
+  },
+  "connections": {
+    "Spuštění jednou za 24 hodin": {
+      "main": [
+        [
+          {
+            "node": "Načtení dat z Google sheets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Načtení dat z Google sheets": {
+      "main": [
+        [
+          {
+            "node": "Kontrola limitů a zpracování dat pro report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Kontrola limitů a zpracování dat pro report": {
+      "main": [
+        [
+          {
+            "node": "Vizualizace dat v HTML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Vizualizace dat v HTML": {
+      "main": [
+        [
+          {
+            "node": "HTML to PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Záloha na Google drive": {
+      "main": [
+        []
+      ]
+    },
+    "Odeslání reportu na e-mail": {
+      "main": [
+        [
+          {
+            "node": "Clear sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTML to PDF": {
+      "main": [
+        [
+          {
+            "node": "Záloha na Google drive",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Odeslání reportu na e-mail",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": false
+  },
+  "versionId": "b1bfac50-0618-477c-a5c9-71e377c608db",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "e9f60320df6fdfd2f89899a4f638642b679b7922cfc622ec30f5ebe626cc077b"
+  },
+  "id": "7cQppcqgxVY5rBmI",
+  "tags": []
+}

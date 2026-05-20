@@ -1,0 +1,623 @@
+{
+  "name": "Proces vyčítání dat",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 0,30 * * * *"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -80,
+        -80
+      ],
+      "id": "ae492f6a-0e6e-48fe-bb49-7cd5ce554c3c",
+      "name": "Spuštění jednou za 30 minut",
+      "retryOnFail": false
+    },
+    {
+      "parameters": {
+        "url": "https://marfy.ecmsystem.cz/Identity/Account/Login",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        144,
+        -176
+      ],
+      "id": "d964bbc2-f0b9-4357-8194-4c017fecbc3f",
+      "name": "GET HTTP Request přihlašovací stránky",
+      "alwaysOutputData": false,
+      "executeOnce": false,
+      "retryOnFail": false,
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://marfy.ecmsystem.cz/Identity/Account/Login",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "cookie",
+              "value": "={{ $json.cookie }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "Input.Email",
+              "value": ""
+            },
+            {
+              "name": "Input.Password",
+              "value": ""
+            },
+            {
+              "name": "__RequestVerificationToken",
+              "value": "={{ $json.token }}"
+            },
+            {
+              "name": "Input.RememberMe",
+              "value": "false"
+            }
+          ]
+        },
+        "options": {
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        592,
+        -176
+      ],
+      "id": "036f690f-9dc0-4ab3-a326-b1aef7e629ba",
+      "name": "POST HTTP Request pro přihlášení"
+    },
+    {
+      "parameters": {
+        "jsCode": "// base cookies (Session + Antiforgery) z GET /Login code node\nconst baseCookie = $node[\"Extrakce antiforgery tokenu a cookies\"].json.cookie;\n\n// identity cookie z POST /Login response\nconst setCookies = $json.headers?.[\"set-cookie\"];\nif (!setCookies || !Array.isArray(setCookies)) {\n  throw new Error(\"No set-cookie on login response\");\n}\n\nconst identityCookie = setCookies\n  .map(c => c.split(\";\")[0])\n  .find(c => c.startsWith(\".AspNetCore.Identity.Application=\"));\n\nif (!identityCookie) {\n  throw new Error(\"Identity cookie not found - login failed\");\n}\n\n// ---- WINDOW INPUT FROM \"When Executed by Another Workflow\" ----\nlet windowStart = null;\nlet windowEnd = null;\n\ntry {\n  const triggerData = $node[\"When Executed by Another Workflow\"]?.json;\n  windowStart = triggerData?.windowStart ?? null;\n  windowEnd = triggerData?.windowEnd ?? null;\n} catch (e) {\n  // ignore if node not present in this execution path\n}\n\n// ---- If not provided → compute last completed :00 / :30 window ----\nif (!windowStart || !windowEnd) {\n  const now = new Date();\n  now.setSeconds(0, 0);\n\n  const minutes = now.getMinutes();\n  now.setMinutes(minutes < 30 ? 0 : 30, 0, 0);\n\n  const end = new Date(now);\n  const start = new Date(end.getTime() - 30 * 60 * 1000);\n\n  windowStart = start.toISOString();\n  windowEnd = end.toISOString();\n}\n\n// ---- FINAL OUTPUT ----\nreturn [{\n  cookie: `${baseCookie}; ${identityCookie}`,\n  windowStart,\n  windowEnd,\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        816,
+        -176
+      ],
+      "id": "f7f127d3-a3f2-4b7c-9618-9b87a73d8cd2",
+      "name": "Vytvoření jednoho výstupu"
+    },
+    {
+      "parameters": {
+        "url": "https://marfy.ecmsystem.cz/?sectionID=4&nodeID=6557",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Cookie",
+              "value": "={{ $json.cookie }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1040,
+        -176
+      ],
+      "id": "09622d49-ec67-4b75-ad0d-8c5a310db7f5",
+      "name": "Otevření stránky s vizualizací"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://marfy.ecmsystem.cz/DynamicWeb/GetChartData",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Cookie",
+              "value": "={{ $('Vytvoření jednoho výstupu').item.json.cookie }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json; charset=UTF-8",
+        "body": "={   \"dynamicWebId\": \"4279\",   \"conditions\": {     \"appliedFilters\": {},     \"useIdealGrouping\": true,     \"rangeId\": \"1\",     \"dateRangeType\": 1,     \"startDt\": \"{{ $('Vytvoření jednoho výstupu').item.json.windowStart }}\",     \"endDt\": \"{{ $('Vytvoření jednoho výstupu').item.json.windowEnd }}\",     \"useCustomYMDSettings\": false,     \"lastYears\": false,     \"lastMonths\": false,     \"lastDays\": false   } }",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1264,
+        -176
+      ],
+      "id": "13d60b6a-5346-420e-b4ba-e8c5ced4d2b7",
+      "name": "POST HTTP Request an vytáhnutí dat pro časové okno 30 minut"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "1SwINCHsHh3krQJJq6sMQxNNW2w1G3VTS_q0HTx-LLLQ",
+          "mode": "list",
+          "cachedResultName": "N8N databáze",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1SwINCHsHh3krQJJq6sMQxNNW2w1G3VTS_q0HTx-LLLQ/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "List 1",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1SwINCHsHh3krQJJq6sMQxNNW2w1G3VTS_q0HTx-LLLQ/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {
+            "time": "={{ $json.time }}",
+            "soc_pct_avg": "={{ $json.soc_pct_avg }}",
+            "dc_current_a_avg": "={{ $json.dc_current_a_avg }}",
+            "dc_voltage_v_avg": "={{ $json.dc_voltage_v_avg }}",
+            "module_temp_max_c_avg": "={{ $json.module_temp_max_c_avg }}",
+            "module_temp_min_c_avg": "={{ $json.module_temp_min_c_avg }}",
+            "cell_id_max_voltage_avg": "={{ $json.cell_id_max_voltage_avg }}",
+            "cell_id_min_voltage_avg": "={{ $json.cell_id_min_voltage_avg }}",
+            "cell_id_max_temp_avg": "={{ $json.cell_id_max_temp_avg }}",
+            "cell_id_min_temp_avg": "={{ $json.cell_id_min_temp_avg }}",
+            "module_id_max_voltage_avg": "={{ $json.module_id_max_voltage_avg }}",
+            "module_id_min_voltage_avg": "={{ $json.module_id_min_voltage_avg }}",
+            "module_id_max_temp_avg": "={{ $json.module_id_max_temp_avg }}",
+            "module_id_min_temp_avg": "={{ $json.module_id_min_temp_avg }}",
+            "cell_voltage_min_v_avg": "={{ $json.cell_voltage_min_v_avg }}",
+            "cell_voltage_max_v_avg": "={{ $json.cell_voltage_max_v_avg }}",
+            "cell_temp_min_c_avg": "={{ $json.cell_temp_min_c_avg }}",
+            "cell_temp_max_c_avg": "={{ $json.cell_temp_max_c_avg }}",
+            "module_voltage_min_v_avg": "={{ $json.module_voltage_min_v_avg }}",
+            "module_voltage_max_v_avg": "={{ $json.module_voltage_max_v_avg }}"
+          },
+          "matchingColumns": [
+            "time"
+          ],
+          "schema": [
+            {
+              "id": "time",
+              "displayName": "time",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "soc_pct_avg",
+              "displayName": "soc_pct_avg",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "dc_current_a_avg",
+              "displayName": "dc_current_a_avg",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "dc_voltage_v_avg",
+              "displayName": "dc_voltage_v_avg",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "module_temp_max_c_avg",
+              "displayName": "module_temp_max_c_avg",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "module_temp_min_c_avg",
+              "displayName": "module_temp_min_c_avg",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "cell_id_max_voltage_avg",
+              "displayName": "cell_id_max_voltage_avg",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "cell_id_min_voltage_avg",
+              "displayName": "cell_id_min_voltage_avg",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "cell_id_max_temp_avg",
+              "displayName": "cell_id_max_temp_avg",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "cell_id_min_temp_avg",
+              "displayName": "cell_id_min_temp_avg",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "module_id_max_voltage_avg",
+              "displayName": "module_id_max_voltage_avg",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "module_id_min_voltage_avg",
+              "displayName": "module_id_min_voltage_avg",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "module_id_max_temp_avg",
+              "displayName": "module_id_max_temp_avg",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "module_id_min_temp_avg",
+              "displayName": "module_id_min_temp_avg",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "cell_voltage_min_v_avg",
+              "displayName": "cell_voltage_min_v_avg",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "cell_voltage_max_v_avg",
+              "displayName": "cell_voltage_max_v_avg",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "cell_temp_min_c_avg",
+              "displayName": "cell_temp_min_c_avg",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "cell_temp_max_c_avg",
+              "displayName": "cell_temp_max_c_avg",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "module_voltage_min_v_avg",
+              "displayName": "module_voltage_min_v_avg",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "module_voltage_max_v_avg",
+              "displayName": "module_voltage_max_v_avg",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        1712,
+        -176
+      ],
+      "id": "684b341d-1119-4c3c-8683-af8827973cfb",
+      "name": "Uložení do Google sheets",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// --- 1) Map elementId -> base name (uprav si jak chceš)\nconst ID_TO_NAME = {\n  23757: \"cell_voltage_min_v\",\n  23758: \"cell_voltage_max_v\",\n  23759: \"cell_temp_min_c\",\n  23760: \"cell_temp_max_c\",\n  23761: \"module_voltage_min_v\",\n  23762: \"module_voltage_max_v\",\n  23763: \"module_temp_max_c\",\n  23764: \"module_temp_min_c\",\n  23765: \"soc_pct\",\n  23766: \"soe_kwh\",\n  23767: \"dc_voltage_v\",\n  23768: \"dc_current_a\",\n\n  23769: \"cell_id_max_temp\",\n  23770: \"cell_id_min_temp\",\n  23771: \"module_id_max_temp\",\n  23772: \"module_id_min_temp\",\n  23773: \"cell_id_max_voltage\",\n  23774: \"cell_id_min_voltage\",\n  23775: \"module_id_max_voltage\",\n  23776: \"module_id_min_voltage\",\n};\n\n// --- 2) n8n někdy balí response do array [ { ... } ]\nconst r = Array.isArray(items[0].json) ? items[0].json[0] : items[0].json;\n\nconst labels = r.labelsData;\nconst dict = r.dictData;\n\nif (!labels || !Array.isArray(labels)) throw new Error(\"labelsData missing\");\nif (!dict || typeof dict !== \"object\") throw new Error(\"dictData missing\");\n\n// --- 3) Helper: parse \"el_23761_avg\" -> { id:23761, agg:'avg' }\nfunction parseKey(key) {\n  const m = key.match(/^el_(\\d+)_(\\w+)$/);\n  if (!m) return null;\n  return { elementId: Number(m[1]), agg: m[2] };\n}\n\n// --- 4) Build column list + accessors\nconst seriesKeys = Object.keys(dict);\n\n// Map to output column names\nconst colNames = seriesKeys.map(k => {\n  const parsed = parseKey(k);\n  if (!parsed) return k; // fallback\n  const base = ID_TO_NAME[parsed.elementId] ?? `element_${parsed.elementId}`;\n  return `${base}_${parsed.agg}`; // e.g. module_voltage_min_v_avg\n});\n\n// --- 5) Create rows: one row per timestamp\n// labels are unix ms timestamps -> ISO\nconst rows = [];\n\nfor (let i = 0; i < labels.length; i++) {\n  const ts = labels[i];\n  const row = { time: new Date(ts).toISOString() };\n\n  for (let s = 0; s < seriesKeys.length; s++) {\n    const key = seriesKeys[s];\n    const col = colNames[s];\n    const arr = dict[key];\n\n    // Some series might be shorter; guard it\n    row[col] = Array.isArray(arr) ? (arr[i] ?? null) : null;\n  }\n\n  rows.push({ json: row });\n}\n\nreturn rows;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1488,
+        -176
+      ],
+      "id": "3ded7e36-0b15-4ea6-9645-349920a95fe2",
+      "name": "Zpracování dat pro uložení"
+    },
+    {
+      "parameters": {
+        "inputSource": "jsonExample",
+        "jsonExample": "\n  {\n    \"forceEndDt\": \"2026-02-20T14:30:00.000Z\",\n    \"windowStart\": \"2026-02-20T14:00:00.000Z\",\n    \"windowEnd\": \"2026-02-20T14:30:00.000Z\",\n    \"now\": \"2026-02-20T14:54:25.096Z\",\n    \"slotKind\": \"halfHour\",\n    \"computedFrom\": \"now_before_wait\"\n  }"
+      },
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -80,
+        -272
+      ],
+      "id": "53f3451f-e5a4-4d45-b008-b2f1d416368e",
+      "name": "When Executed by Another Workflow"
+    },
+    {
+      "parameters": {
+        "jsCode": "// HTML z GET /Login\nconst html = $json.data || $json.body;\n\n// vytáhnout antiforgery token z HTML\nconst tokenMatch = html.match(\n  /<input[^>]+name=\"__RequestVerificationToken\"[^>]+value=\"([^\"]+)\"/i\n);\n\nif (!tokenMatch) {\n  throw new Error('RequestVerificationToken NOT FOUND in HTML');\n}\n\nconst requestVerificationToken = tokenMatch[1];\n\n// vytáhnout cookies z response headers\nconst setCookies = $json.headers?.['set-cookie'];\n\nif (!Array.isArray(setCookies)) {\n  throw new Error('Set-Cookie headers NOT FOUND');\n}\n\n// vybrat jen důležité cookies\nconst cookieParts = setCookies\n  .filter(c =>\n    c.startsWith('.AspNetCore.Session=') ||\n    c.startsWith('.AspNetCore.Antiforgery.')\n  )\n  .map(c => c.split(';')[0]);\n\nif (cookieParts.length < 2) {\n  throw new Error('Missing Session or Antiforgery cookie');\n}\n\n// složit Cookie header \nconst cookieHeader = cookieParts.join('; ');\n\n// vrátit všechno připravené pro POST\nreturn [{\n  token: requestVerificationToken,\n  cookie: cookieHeader\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        368,
+        -176
+      ],
+      "id": "05b65cf7-a3b4-418a-8cc6-d2cc49290938",
+      "name": "Extrakce antiforgery tokenu a cookies"
+    }
+  ],
+  "pinData": {
+    "Spuštění jednou za 30 minut": [
+      {
+        "json": {
+          "timestamp": "2026-02-20T05:00:00.005+01:00",
+          "Readable date": "February 20th 2026, 5:00:00 am",
+          "Readable time": "5:00:00 am",
+          "Day of week": "Friday",
+          "Year": "2026",
+          "Month": "February",
+          "Day of month": "20",
+          "Hour": "05",
+          "Minute": "00",
+          "Second": "00",
+          "Timezone": "Europe/Berlin (UTC+01:00)"
+        },
+        "pairedItem": {
+          "item": 0
+        }
+      }
+    ]
+  },
+  "connections": {
+    "Spuštění jednou za 30 minut": {
+      "main": [
+        [
+          {
+            "node": "GET HTTP Request přihlašovací stránky",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GET HTTP Request přihlašovací stránky": {
+      "main": [
+        [
+          {
+            "node": "Extrakce antiforgery tokenu a cookies",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "POST HTTP Request pro přihlášení": {
+      "main": [
+        [
+          {
+            "node": "Vytvoření jednoho výstupu",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Vytvoření jednoho výstupu": {
+      "main": [
+        [
+          {
+            "node": "Otevření stránky s vizualizací",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Otevření stránky s vizualizací": {
+      "main": [
+        [
+          {
+            "node": "POST HTTP Request an vytáhnutí dat pro časové okno 30 minut",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "POST HTTP Request an vytáhnutí dat pro časové okno 30 minut": {
+      "main": [
+        [
+          {
+            "node": "Zpracování dat pro uložení",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Zpracování dat pro uložení": {
+      "main": [
+        [
+          {
+            "node": "Uložení do Google sheets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Uložení do Google sheets": {
+      "main": [
+        []
+      ]
+    },
+    "When Executed by Another Workflow": {
+      "main": [
+        [
+          {
+            "node": "GET HTTP Request přihlašovací stránky",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extrakce antiforgery tokenu a cookies": {
+      "main": [
+        [
+          {
+            "node": "POST HTTP Request pro přihlášení",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": false,
+    "timeSavedMode": "fixed",
+    "errorWorkflow": "FO3st3ec-P26sbhpVLE3w",
+    "callerPolicy": "workflowsFromSameOwner",
+    "binaryMode": "separate"
+  },
+  "versionId": "d91da65d-dd15-4bd1-ba9e-3335e9d74040",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "e9f60320df6fdfd2f89899a4f638642b679b7922cfc622ec30f5ebe626cc077b"
+  },
+  "id": "BZ1W3QGgBmN2PBAe",
+  "tags": []
+}
